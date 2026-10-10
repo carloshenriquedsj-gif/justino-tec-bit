@@ -18,7 +18,7 @@ CHANNELS = ['Shopee', 'Mercado Livre', 'Nuvemshop', 'Amazon', 'Outros', 'Não id
 app = FastAPI(title='Justino Tec Bit v1.1')
 if not os.getenv('SESSION_SECRET') or not os.getenv('ADMIN_PASSWORD'):
     raise RuntimeError('Defina SESSION_SECRET e ADMIN_PASSWORD antes de iniciar.')
-app.add_middleware(SessionMiddleware, secret_key=os.environ['SESSION_SECRET'], https_only=os.getenv('COOKIE_SECURE','true').lower() == 'true', same_site='strict', max_age=8*3600)
+
 FAILED = {}
 
 @app.middleware('http')
@@ -37,7 +37,11 @@ async def guard(request: Request, call_next):
         if origin and origin != expected:
             return JSONResponse({'detail':'Origem não permitida'},status_code=403)
     return await call_next(request)
-
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SESSION_SECRET"),
+    https_only=True
+)
 @app.get('/health')
 def health(): return {'status':'ok'}
 
