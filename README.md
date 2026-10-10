@@ -1,4 +1,3 @@
-[app_justino_corrigido.py](https://github.com/user-attachments/files/33289498/app_justino_corrigido.py)
 import csv, hashlib, io, os, re, sqlite3, xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime
