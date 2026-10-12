@@ -15,10 +15,9 @@ BASE = Path(__file__).resolve().parent
 DB = Path(os.environ.get('GESTOR_DB', str(BASE / 'gestor.db')))
 MAX_SIZE = 12 * 1024 * 1024
 CHANNELS = ['Shopee', 'Mercado Livre', 'Nuvemshop', 'Amazon', 'Outros', 'Não identificado']
-app = FastAPI(title='Justino Tec Bit v1.1')
+app = FastAPI(title='Justino Tec Bit v1.2')
 if not os.getenv('SESSION_SECRET') or not os.getenv('ADMIN_PASSWORD'):
     raise RuntimeError('Defina SESSION_SECRET e ADMIN_PASSWORD antes de iniciar.')
-
 FAILED = {}
 
 @app.middleware('http')
@@ -26,6 +25,7 @@ async def guard(request: Request, call_next):
     path = request.url.path
     if path.startswith('/static/') or path in ('/login', '/health'):
         return await call_next(request)
+
     if not request.session.get('authenticated'):
         if path.startswith('/api/'):
             return JSONResponse({'detail':'Sessão expirada. Faça login.'},status_code=401)
@@ -37,11 +37,10 @@ async def guard(request: Request, call_next):
         if origin and origin != expected:
             return JSONResponse({'detail':'Origem não permitida'},status_code=403)
     return await call_next(request)
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=os.getenv("SESSION_SECRET"),
-    https_only=True
-)
+
+# Register session middleware LAST so it runs BEFORE the authentication guard.
+app.add_middleware(SessionMiddleware, secret_key=os.environ['SESSION_SECRET'], https_only=os.getenv('COOKIE_SECURE','true').lower() == 'true', same_site='strict', max_age=8*3600)
+
 @app.get('/health')
 def health(): return {'status':'ok'}
 
@@ -91,7 +90,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES invoices(id), product_id INTEGER REFERENCES products(id), sku TEXT, description TEXT NOT NULL, quantity REAL NOT NULL, unit_cents INTEGER NOT NULL, total_cents INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_items_invoice ON items(invoice_id);
         ''')
-init_db()
+@app.on_event("startup")
+def startup_database():
+    init_db()
 
 class ProductIn(BaseModel):
     sku: str = Field(min_length=1, max_length=100)
