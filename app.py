@@ -134,17 +134,65 @@ def parse_xml(content):
     return dict(access_key=access_key, number=val(ide,'nNF'), issued_at=val(ide,'dhEmi') or val(ide,'dEmi'), items=items, status='confirmado_xml')
 
 def parse_pdf(content):
+    """Lê DANFE textual no layout de tabela das notas de exemplo.
+
+    Outros layouts continuam em revisão, para evitar registrar vendas erradas.
+    """
     try:
         with fitz.open(stream=content, filetype='pdf') as doc:
             if doc.page_count > 30: raise ValueError('PDF acima de 30 páginas')
-            txt = '\n'.join(page.get_text() for page in doc)
+            pages = [(page.get_text(), page.get_text('words')) for page in doc]
     except ValueError: raise
     except Exception: raise ValueError('PDF inválido')
+    txt = '\n'.join(text for text, _ in pages)
     if not txt.strip(): raise ValueError('PDF sem texto selecionável; OCR ainda não implementado')
-    # PDF varia por emissor; não inferir itens sem confiança.
     match = re.search(r'(?<!\d)(?:\d[\s.]*){44}(?!\d)', txt)
     key = re.sub(r'\D', '', match.group(0)) if match else None
-    return dict(access_key=key, number='', issued_at='', items=[], status='revisao_pdf')
+    number_match = re.search(r'N[º°o]?\s*([0-9]{1,3}(?:\.[0-9]{3}){1,3})', txt, re.I)
+    number = number_match.group(1).replace('.', '') if number_match else ''
+    date_match = re.search(r'EMIS\.?\s*:\s*(\d{2}/\d{2}/\d{4})', txt, re.I)
+    issued_at = datetime.strptime(date_match.group(1), '%d/%m/%Y').date().isoformat() if date_match else ''
+    items = []
+    # Reconhece o DANFE tabular presente nas amostras, pelas coordenadas
+    # relativas dos cabeçalhos. Não usa os valores do resumo fiscal como itens.
+    for text, words in pages:
+        if 'DADOS DO PRODUTO' not in text or 'VALOR' not in text or 'QUANT.' not in text:
+            continue
+        headers = [w for w in words if w[4] == 'QUANT.']
+        for header in headers:
+            header_y = header[1]
+            # O cabeçalho está próximo das linhas de produtos; restringe a região
+            # para não capturar totais, transportador ou dados adicionais.
+            end_candidates = [w[1] for w in words if w[4] == 'ADICIONAIS' and w[1] > header_y]
+            end_y = min(end_candidates) if end_candidates else header_y + 220
+            body = [w for w in words if header_y + 5 < w[1] < end_y - 5]
+            lines = {}
+            for w in body:
+                y = round(w[1] / 3) * 3
+                lines.setdefault(y, []).append(w)
+            for row in lines.values():
+                # Layout conhecido: código em x~18, descrição x~80,
+                # quantidade x~307, preço x~339 e total x~378 (A4 595pt).
+                def field(lo, hi):
+                    return ' '.join(w[4] for w in sorted(row, key=lambda w: w[0]) if lo <= w[0] < hi).strip()
+                sku = field(15, 77)
+                description = field(77, 200)
+                quantity_s = field(288, 325)
+                unit_s = field(325, 366)
+                total_s = field(366, 408)
+                if not (sku and description and re.fullmatch(r'\d+[\.,]\d+', quantity_s)
+                        and re.fullmatch(r'[\d\.,]+', unit_s) and re.fullmatch(r'[\d\.,]+', total_s)):
+                    continue
+                qty = float(quantity_s.replace('.', '').replace(',', '.'))
+                unit = cents(unit_s.replace('.', '').replace(',', '.'))
+                total = cents(total_s.replace('.', '').replace(',', '.'))
+                if qty <= 0 or total <= 0 or abs(round(qty * unit) - total) > 1:
+                    continue
+                items.append(dict(sku=sku, description=description, quantity=qty,
+                                  unit_cents=unit, total_cents=total))
+    # Se o leiaute não é reconhecido, preserva a revisão manual.
+    return dict(access_key=key, number=number, issued_at=issued_at,
+                items=items, status='extraido_pdf' if items else 'revisao_pdf')
 
 @app.get('/')
 def home(): return FileResponse(BASE / 'static' / 'index.html')
@@ -161,6 +209,44 @@ def add_product(p: ProductIn):
             return {'id':cur.lastrowid}
         except sqlite3.IntegrityError: raise HTTPException(409,'SKU já cadastrado')
 
+def detect_marketplace(filename: str, content: bytes, extension: str) -> str:
+    """Identifica o canal somente quando houver indícios explícitos.
+
+    DANFE padrão não contém necessariamente a origem da venda.
+    """
+    filename_norm = filename.lower()
+    rules = [
+        ('Amazon', r'amazon|amzon'),
+        ('Shopee', r'shopee'),
+        ('Mercado Livre', r'mercado[ _-]?livre|mercadolivre|meli'),
+        ('Nuvemshop', r'nuvemshop|tiendanube'),
+    ]
+    # Nome de arquivo fornecido pelo vendedor pode ser uma pista útil,
+    # mas não é prova fiscal da origem da venda.
+    matches = [channel for channel, pattern in rules if re.search(pattern, filename_norm, re.I)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        return 'Não identificado'
+
+    try:
+        if extension == '.pdf':
+            with fitz.open(stream=content, filetype='pdf') as doc:
+                sample = '\n'.join(page.get_text() for page in list(doc)[:3])
+        else:
+            sample = content.decode('utf-8-sig', errors='replace')
+    except Exception:
+        return 'Não identificado'
+    # Referências explícitas a marketplace; nomes genéricos não são usados.
+    text_rules = [
+        ('Amazon', r'\b(?:amazon(?:\.com\.br)?|amazon marketplace)\b'),
+        ('Shopee', r'\bshopee\b'),
+        ('Mercado Livre', r'\bmercado\s*livre\b|\bmercadolivre\b'),
+        ('Nuvemshop', r'\bnuvemshop\b|\btiendanube\b'),
+    ]
+    matches = [channel for channel, pattern in text_rules if re.search(pattern, sample, re.I)]
+    return matches[0] if len(matches) == 1 else 'Não identificado'
+
 @app.post('/api/import')
 async def import_files(files: list[UploadFile] = File(...), marketplace: str = Form('Não identificado')):
     if marketplace not in CHANNELS: raise HTTPException(400,'Marketplace inválido')
@@ -176,16 +262,24 @@ async def import_files(files: list[UploadFile] = File(...), marketplace: str = F
         fingerprint=hashlib.sha256(raw).hexdigest()
         try:
             data=parse_xml(raw) if ext=='.xml' else parse_pdf(raw)
+            auto_marketplace = detect_marketplace(name, raw, ext)
+            selected_marketplace = auto_marketplace if auto_marketplace != 'Não identificado' else marketplace
             with connect() as db:
-                duplicate=db.execute('SELECT id FROM invoices WHERE fingerprint=? OR (access_key IS NOT NULL AND access_key=?)',(fingerprint,data['access_key'])).fetchone()
-                if duplicate:
+                duplicate=db.execute('SELECT id,status FROM invoices WHERE fingerprint=? OR (access_key IS NOT NULL AND access_key=?)',(fingerprint,data['access_key'])).fetchone()
+                if duplicate and not (duplicate['status'] == 'revisao_pdf' and data['items']):
                     results.append({'file':name,'status':'duplicado','invoice_id':duplicate['id']}); continue
-                cur=db.execute('INSERT INTO invoices(access_key,fingerprint,number,issued_at,marketplace,source_type,filename,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)', (data['access_key'],fingerprint,data['number'],data['issued_at'],marketplace,ext[1:],name,data['status'],datetime.now().isoformat(timespec='seconds')))
-                inv_id=cur.lastrowid
+                if duplicate:
+                    inv_id=duplicate['id']
+                    db.execute('UPDATE invoices SET number=?,issued_at=?,status=?,marketplace=? WHERE id=?',
+                               (data['number'],data['issued_at'],data['status'],selected_marketplace,inv_id))
+                    db.execute('DELETE FROM items WHERE invoice_id=?',(inv_id,))
+                else:
+                    cur=db.execute('INSERT INTO invoices(access_key,fingerprint,number,issued_at,marketplace,source_type,filename,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)', (data['access_key'],fingerprint,data['number'],data['issued_at'],selected_marketplace,ext[1:],name,data['status'],datetime.now().isoformat(timespec='seconds')))
+                    inv_id=cur.lastrowid
                 for it in data['items']:
                     prod=db.execute('SELECT id FROM products WHERE sku=?',(it['sku'],)).fetchone()
                     db.execute('INSERT INTO items(invoice_id,product_id,sku,description,quantity,unit_cents,total_cents) VALUES(?,?,?,?,?,?,?)',(inv_id,prod['id'] if prod else None,it['sku'],it['description'],it['quantity'],it['unit_cents'],it['total_cents']))
-            results.append({'file':name,'status':data['status'],'invoice_id':inv_id,'items':len(data['items'])})
+            results.append({'file':name,'status':data['status'],'invoice_id':inv_id,'items':len(data['items']),'marketplace':selected_marketplace})
         except (ValueError,sqlite3.IntegrityError) as exc:
             results.append({'file':name,'status':'erro','detail':str(exc)})
     return {'results':results}
