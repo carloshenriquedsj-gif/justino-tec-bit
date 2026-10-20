@@ -8,7 +8,7 @@ import fitz
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse, HTMLResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
-import secrets, time
+import secrets, time, tempfile
 from pydantic import BaseModel, Field
 
 BASE = Path(__file__).resolve().parent
@@ -296,6 +296,32 @@ def update_marketplace(invoice_id:int, marketplace:str):
         c=db.execute('UPDATE invoices SET marketplace=? WHERE id=?',(marketplace,invoice_id))
         if not c.rowcount: raise HTTPException(404,'Nota não encontrada')
     return {'ok':True}
+
+@app.delete('/api/invoices/{invoice_id}')
+def delete_invoice(invoice_id: int):
+    """Exclui a nota e seus itens em uma unica transacao."""
+    with connect() as db:
+        exists = db.execute('SELECT id FROM invoices WHERE id=?', (invoice_id,)).fetchone()
+        if not exists:
+            raise HTTPException(404, 'Importação não encontrada')
+        db.execute('DELETE FROM items WHERE invoice_id=?', (invoice_id,))
+        db.execute('DELETE FROM invoices WHERE id=?', (invoice_id,))
+    return {'ok': True, 'deleted_id': invoice_id}
+
+@app.get('/api/backup')
+def download_backup():
+    """Copia consistente do SQLite, incluindo produtos, notas e itens.
+    Os PDFs/XMLs originais nao estao armazenados no banco atual.
+    """
+    with tempfile.TemporaryDirectory() as folder:
+        snapshot = Path(folder) / 'justino_backup.sqlite3'
+        with sqlite3.connect(DB) as source, sqlite3.connect(snapshot) as target:
+            source.backup(target)
+        contents = snapshot.read_bytes()
+    filename = 'justino_backup_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '.sqlite3'
+    return StreamingResponse(iter([contents]), media_type='application/octet-stream',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"',
+                 'Cache-Control': 'no-store'})
 
 @app.get('/api/report')
 def report():
